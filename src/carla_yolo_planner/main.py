@@ -146,6 +146,9 @@ def main():
             
             if args.in_carla:
                 try:
+                    # 推进世界模拟（同步模式下必须调用）
+                    client.tick()
+                    
                     client.follow_vehicle()
                     client.draw_vehicle_boxes()
                     

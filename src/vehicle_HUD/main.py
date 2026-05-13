@@ -46,6 +46,36 @@ def main():
     vehicle.set_autopilot(True)
     spectator = world.get_spectator()
 
+    # 路径规划导航系统（全局变量，在函数内部定义）
+    nav_enabled = False
+    destination = None
+    next_waypoint = None
+    navigation_route = []
+    
+    # 初始化导航（自动启动）
+    def init_navigation():
+        nonlocal destination, next_waypoint, navigation_route, nav_enabled
+        map = world.get_map()
+        spawn_points = map.get_spawn_points()
+        if len(spawn_points) >= 2:
+            # 随机选择一个目的地（不是当前位置）
+            current_loc = vehicle.get_location()
+            candidates = [sp for sp in spawn_points if sp.location.distance(current_loc) > 50]
+            if candidates:
+                destination_point = random.choice(candidates)
+                destination = destination_point.location
+                navigation_route = [destination]
+                next_waypoint = destination
+                nav_enabled = True
+                print(f"导航已启动，目的地距离: {current_loc.distance(destination):.1f} 米")
+            else:
+                print("无法找到合适的目的地")
+        else:
+            print("地图上可用的生成点不足")
+    
+    # 启动时自动初始化导航
+    init_navigation()
+
     # 视角模式
     camera_mode = 'top'  # 'top', 'follow', 'chase', 'side'
     
@@ -136,6 +166,54 @@ def main():
     speed_limit = 60  # 默认限速 60 km/h
     speed_warning_enabled = True
     
+    # 更新导航信息
+    def update_navigation():
+        nonlocal next_waypoint, nav_enabled, destination
+        if not nav_enabled or destination is None:
+            return None
+        
+        current_loc = vehicle.get_location()
+        distance_to_dest = current_loc.distance(destination)
+        
+        # 到达目的地检测（距离小于5米）
+        if distance_to_dest < 5:
+            print("已到达目的地！")
+            init_navigation()  # 重新设置新目的地
+            return None
+        
+        # 计算方向（Carla坐标系：X向东，Y向北）
+        dx = destination.x - current_loc.x  # 东方向
+        dy = destination.y - current_loc.y  # 北方向
+        
+        # 获取车辆朝向（yaw：0=北，90=东，180=南，270=西）
+        vehicle_yaw = vehicle.get_transform().rotation.yaw
+        
+        # 计算目标方向角度（0=东，90=北，180=西，270=南）
+        target_angle = np.degrees(np.arctan2(dy, dx))  # arctan2(y, x) -> 从X轴正方向逆时针角度
+        
+        # 将目标角度转换为Carla坐标系（0=北，90=东）
+        target_angle_carla = 90 - target_angle
+        
+        # 计算角度差
+        angle_diff = target_angle_carla - vehicle_yaw
+        # 归一化到 -180 到 180
+        angle_diff = (angle_diff + 180) % 360 - 180
+        
+        return {
+            'distance': round(distance_to_dest, 1),
+            'direction': get_direction_text(angle_diff),
+            'angle_diff': round(angle_diff, 1)
+        }
+    
+    # 获取方向文本
+    def get_direction_text(angle_diff):
+        if angle_diff < -45:
+            return "LEFT"
+        elif angle_diff > 45:
+            return "RIGHT"
+        else:
+            return "STRAIGHT"
+    
     # 获取车辆状态数据
     def get_vehicle_data():
         velocity = vehicle.get_velocity()
@@ -197,6 +275,18 @@ def main():
             f"Brake: {data['brake_status']}"
         ]
         
+        # 添加导航信息
+        nav_data = update_navigation()
+        if nav_data:
+            nav_lines = [
+                f"[NAV] Distance: {nav_data['distance']} m",
+                f"[NAV] Direction: {nav_data['direction']}",
+                f"[NAV] Angle: {nav_data['angle_diff']}°"
+            ]
+            hud_lines.extend(nav_lines)
+        elif nav_enabled:
+            hud_lines.append("[NAV] Calculating...")
+        
         start_x = 10
         start_y = 30
         line_height = 25
@@ -208,9 +298,66 @@ def main():
                          (start_x + text_width + 5, y + 5), bg_color, -1)
             # 速度超过限制时使用红色警告
             current_color = speed_warning_color if i == 0 else text_color
+            # 导航信息使用蓝色
+            if "[NAV]" in line:
+                current_color = (255, 0, 0)  # 红色导航
             cv2.putText(image, line, (start_x, y), font, font_scale, current_color, font_thickness)
         
+        # 绘制导航箭头指示
+        if nav_data and hud_enabled:
+            draw_navigation_arrow(image, nav_data['direction'])
+        
         return image
+    
+    # 绘制导航箭头
+    def draw_navigation_arrow(image, direction):
+        height, width = image.shape[:2]
+        arrow_center_x = width // 2
+        arrow_center_y = height - 40
+        
+        # 箭头大小
+        arrow_size = 15
+        
+        # 清除箭头区域背景
+        cv2.rectangle(image, (arrow_center_x - 35, arrow_center_y - 25), 
+                     (arrow_center_x + 35, arrow_center_y + 20), (0, 0, 0), -1)
+        
+        # 绘制箭头底座（指向屏幕前方）
+        base_size = 8
+        cv2.line(image, 
+                 (arrow_center_x - base_size, arrow_center_y + 10), 
+                 (arrow_center_x + base_size, arrow_center_y + 10), 
+                 (255, 255, 255), 2)
+        
+        # 根据方向绘制箭头（相对于车辆前方）
+        if direction == "LEFT":
+            # 向左箭头（从底座向左上方）
+            pts = np.array([[arrow_center_x - base_size, arrow_center_y + 10],
+                           [arrow_center_x - base_size - arrow_size, arrow_center_y + 10 - arrow_size],
+                           [arrow_center_x - base_size + 5, arrow_center_y + 10]], np.int32)
+            cv2.polylines(image, [pts], False, (0, 255, 0), 2)
+            cv2.putText(image, "LEFT", (arrow_center_x - 60, arrow_center_y + 15), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        elif direction == "RIGHT":
+            # 向右箭头（从底座向右上方）
+            pts = np.array([[arrow_center_x + base_size, arrow_center_y + 10],
+                           [arrow_center_x + base_size + arrow_size, arrow_center_y + 10 - arrow_size],
+                           [arrow_center_x + base_size - 5, arrow_center_y + 10]], np.int32)
+            cv2.polylines(image, [pts], False, (0, 255, 0), 2)
+            cv2.putText(image, "RIGHT", (arrow_center_x + 15, arrow_center_y + 15), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        else:
+            # 直行箭头（向上）
+            pts = np.array([[arrow_center_x, arrow_center_y + 10],
+                           [arrow_center_x, arrow_center_y + 10 - arrow_size],
+                           [arrow_center_x - 5, arrow_center_y + 10]], np.int32)
+            cv2.polylines(image, [pts], False, (0, 255, 0), 2)
+            pts = np.array([[arrow_center_x, arrow_center_y + 10],
+                           [arrow_center_x, arrow_center_y + 10 - arrow_size],
+                           [arrow_center_x + 5, arrow_center_y + 10]], np.int32)
+            cv2.polylines(image, [pts], False, (0, 255, 0), 2)
+            cv2.putText(image, "STRAIGHT", (arrow_center_x - 35, arrow_center_y + 15), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     try:
         while True:
@@ -292,6 +439,8 @@ def main():
             elif key == ord('s') or key == ord('S'):
                 camera_mode = 'side'
                 print("切换到侧视视角")
+            elif key == ord('n') or key == ord('N'):
+                init_navigation()
 
             # 清理旧帧
             max_to_keep = 5
