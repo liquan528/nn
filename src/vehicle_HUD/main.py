@@ -162,6 +162,66 @@ def main():
     # HUD 显示开关
     hud_enabled = True
     
+    # 天气/时间系统
+    weather_types = ['Clear', 'Cloudy', 'Rain', 'Fog', 'Snow']
+    current_weather_index = 0  # 默认晴天
+    current_hour = 12  # 默认中午 12 点
+    
+    # 设置初始天气和时间
+    def set_weather_and_time():
+        nonlocal current_weather_index, current_hour
+        
+        # 计算太阳高度角（根据时间）
+        sun_altitude = 90 - abs(current_hour - 12) * 15
+        
+        # 创建天气参数对象
+        weather = carla.WeatherParameters()
+        
+        # 根据天气类型设置参数
+        if weather_types[current_weather_index] == 'Clear':
+            weather.cloudiness = 0.0
+            weather.precipitation = 0.0
+            weather.precipitation_deposits = 0.0
+            weather.fog_density = 0.0
+            weather.wetness = 0.0
+        elif weather_types[current_weather_index] == 'Cloudy':
+            weather.cloudiness = 80.0
+            weather.precipitation = 0.0
+            weather.precipitation_deposits = 0.0
+            weather.fog_density = 0.0
+            weather.wetness = 0.0
+        elif weather_types[current_weather_index] == 'Rain':
+            weather.cloudiness = 60.0
+            weather.precipitation = 40.0
+            weather.precipitation_deposits = 40.0
+            weather.fog_density = 10.0
+            weather.wetness = 60.0
+        elif weather_types[current_weather_index] == 'Fog':
+            weather.cloudiness = 90.0
+            weather.precipitation = 0.0
+            weather.precipitation_deposits = 0.0
+            weather.fog_density = 85.0
+            weather.wetness = 10.0
+        elif weather_types[current_weather_index] == 'Snow':
+            weather.cloudiness = 70.0
+            weather.precipitation = 80.0
+            weather.precipitation_deposits = 80.0
+            weather.fog_density = 20.0
+            weather.wetness = 70.0
+        
+        # 根据时间调整太阳角度
+        weather.sun_altitude_angle = sun_altitude
+        weather.sun_azimuth_angle = 0
+        
+        world.set_weather(weather)
+    
+    # 获取当前天气名称
+    def get_weather_name():
+        return weather_types[current_weather_index]
+    
+    # 设置初始天气和时间
+    set_weather_and_time()
+    
     # 速度限制警告系统
     speed_limit = 60  # 默认限速 60 km/h
     speed_warning_enabled = True
@@ -266,13 +326,18 @@ def main():
             speed_warning = True
             speed_warning_color = (0, 0, 255)  # 红色警告
         
+        # 获取当前时间（模拟）
+        current_time_str = f"{current_hour:02d}:00"
+        
         hud_lines = [
             f"Speed: {data['speed']} km/h",
             f"Limit: {speed_limit} km/h",
             f"Throttle: {data['throttle']}%",
             f"Steer: {data['steer']}%",
             f"Gear: {data['gear']}",
-            f"Brake: {data['brake_status']}"
+            f"Brake: {data['brake_status']}",
+            f"Weather: {get_weather_name()}",
+            f"Time: {current_time_str}"
         ]
         
         # 添加导航信息
@@ -441,6 +506,16 @@ def main():
                 print("切换到侧视视角")
             elif key == ord('n') or key == ord('N'):
                 init_navigation()
+            elif key == ord('v') or key == ord('V'):
+                # 切换天气
+                current_weather_index = (current_weather_index + 1) % len(weather_types)
+                set_weather_and_time()
+                print(f"天气切换到：{get_weather_name()}")
+            elif key == ord('u') or key == ord('U'):
+                # 切换时间（小时）
+                current_hour = (current_hour + 3) % 24
+                set_weather_and_time()
+                print(f"时间切换到：{current_hour:02d}:00")
 
             # 清理旧帧
             max_to_keep = 5

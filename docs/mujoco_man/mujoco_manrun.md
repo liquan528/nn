@@ -10,12 +10,7 @@
 
 ### 1.2 项目整体流程
 
-```mermaid
-flowchart TD
-  Input[输入层<br/>键盘/ROS] --> FSM[状态机<br/>状态切换] --> CPG[CPG步态生成器] --> Target[关节目标生成]
-  Target --> Torque[力矩计算] --> PID[PD/PID控制器] --> Act[执行器映射] --> Sim[MuJoCo<br/>物理仿真]
-  Sim -->|传感器反馈| Torque
-```
+![项目流程](./assets/mujoco_man.png)
 
 该系统形成完整的机器人控制闭环：
 输入 → 状态机 → 步态生成 → 姿态稳定 → actuator控制 → 仿真反馈
@@ -300,7 +295,7 @@ if com[2] < 0.25 or (com[2] < 0.4 and tilt > 0.6):
 
 ## 4. 系统整体架构
 图 1 人形机器人控制整体架构图
-<img width="980" height="540" alt="mujoco_manrun_arch" src="assets/mujoco_manrun_arch.png" />
+![mujoco_manrun_arch](./assets/mujoco_manrun_arch.png)
 
 本项目的控制闭环包含输入层、高层状态机、CPG 步态生成、低阶 PD/PID 控制、执行器映射、MuJoCo 仿真与传感器反馈七大模块，形成完整的状态机 - 步态 - 控制 - 仿真闭环。
 
@@ -543,7 +538,7 @@ def _should_log(self, key, interval_s):
 ### 6.4 开局“秒摔”与复位后连摔
 
 - **问题本质**：落地接触未建立时系统处于欠约束；复位后立刻切 WALK 容易重复摔倒。
-- **解决方案**：外力支撑窗口 + 跌倒恢复锁 HumanoidStabilizer.\_calculate\_stabilizing\_torques(main.py#L760-L772)、[simulate\_stable\_standing](main.py#L906-L921)。
+- **解决方案**：外力支撑窗口 + 跌倒恢复锁 HumanoidStabilizer.\_calculate\_stabilizing\_torques(main.py#L760-L772)、simulate\_stable\_standing(main.py#L906-L921)。
 
 ## 7. 系统运行效果
 
@@ -571,9 +566,10 @@ def _should_log(self, key, interval_s):
 
 ### 7.3 运行结果图片
 图 2 机器人稳定站立仿真效果
-<img width="1280" height="720" alt="standing" src="assets/stand.png" />
+![机器人稳定站立仿真效果](./assets/stand.png)
+
 图 3 机器人周期行走仿真效果
-<img width="1280" height="720" alt="walking" src="assets/walk.png" />
+![机器人周期行走仿真效果](./assets/walk.png)
 
 ## 8. 现存不足与后续优化方向
 
@@ -600,4 +596,5 @@ def _should_log(self, key, interval_s):
 
 ## 参考文献
 [1] 刘成举。基于自学习 CPG 的仿人机器人自适应行走控制 [J]. 自动化学报，2021, 47 (8): 1652-1661.
+
 [2] Todorov E, Erez T, Tassa Y. MuJoCo: A physics engine for model-based control[C]//2012 IEEE/RSJ International Conference on Intelligent Robots and Systems. IEEE, 2012: 5026-5033.
