@@ -18,27 +18,32 @@ p3 = os.path.dirname(p2)
 image_folder = os.path.join(p3, "images")
 lidar_folder = os.path.join(p3, "lidar")
 collision_folder = os.path.join(p3, "collision")
+semantic_folder = os.path.join(p3, "semantic")
 os.makedirs(image_folder, exist_ok=True)
 os.makedirs(lidar_folder, exist_ok=True)
 os.makedirs(collision_folder, exist_ok=True)
+os.makedirs(semantic_folder, exist_ok=True)
 
 # ====================== 配置 ======================
 SAVE_INTERVAL = 5 * 60
 COLLISION_COOLDOWN_SEC = 3.0
 
-# 动态交通配置（安全保守值）
-MAX_VEHICLES = 4          # 同时最多4辆
-MAX_PEDESTRIANS = 5       # 最多5个行人
-SPAWN_RADIUS = 40         # 生成半径
-REMOVE_DISTANCE = 80      # 移除距离
-SPAWN_INTERVAL = 5.0      # 每5秒尝试生成一次
-MAX_SPAWN_ATTEMPTS = 1    # 每次只尝试1个
+# 动态交通配置
+MAX_VEHICLES = 4
+MAX_PEDESTRIANS = 5
+SPAWN_RADIUS = 40
+REMOVE_DISTANCE = 80
+SPAWN_INTERVAL = 5.0
+MAX_SPAWN_ATTEMPTS = 1
 
 # 全局变量
 last_save_time = time.time()
-latest_camera = None
-latest_follow = None
+latest_camera = None          # RGB 车载相机
+latest_follow = None          # RGB 跟随相机
 latest_lidar = None
+latest_semantic = None        # 语义分割彩色图
+display_mode = "rgb"          # "rgb" 或 "semantic"
+
 collision_cooldown = False
 collision_cooldown_time = 0
 error_count = 0
@@ -54,7 +59,7 @@ last_spawn_time = time.time()
 vehicle_blueprints = []
 pedestrian_blueprints = []
 
-# ====================== 连接 CARLA（带重试） ======================
+# ====================== 连接 CARLA ======================
 def connect_carla(retries=3):
     for i in range(retries):
         try:
@@ -141,8 +146,7 @@ def spawn_random_vehicle_near(ego_location):
             new_vehicle.set_autopilot(True)
             spawned_vehicles.append(new_vehicle)
             all_spawned_actors.append(new_vehicle)
-            # print(f"🚗 生成车辆: {blueprint.id}")
-            return new_vehicle
+        return new_vehicle
     except Exception as e:
         print(f"生成车辆异常: {e}")
     return None
@@ -174,8 +178,7 @@ def spawn_random_pedestrian_near(ego_location):
                 all_spawned_actors.append(controller)
             spawned_pedestrians.append(new_walker)
             all_spawned_actors.append(new_walker)
-            # print(f"🚶 生成行人")
-            return new_walker
+        return new_walker
     except Exception as e:
         print(f"生成行人异常: {e}")
     return None
@@ -206,75 +209,107 @@ def remove_far_actors(ego_location):
             pass
 
 # ====================== 传感器创建 ======================
-def spawn_safe_sensor(bp_name, transform, attach_to):
+def spawn_safe_sensor(bp_name, transform, attach_to, attributes=None):
     try:
         bp = blueprint_library.find(bp_name)
         if bp is None:
             print(f"找不到蓝图 {bp_name}")
             return None
+        if attributes:
+            for key, value in attributes.items():
+                bp.set_attribute(key, str(value))
         return world.spawn_actor(bp, transform, attach_to=attach_to)
     except Exception as e:
         print(f"传感器 {bp_name} 生成失败: {e}")
         return None
 
+# RGB 相机（前向）
 camera_front = spawn_safe_sensor('sensor.camera.rgb',
                                  carla.Transform(carla.Location(x=1.5, z=2.4)),
-                                 vehicle)
+                                 vehicle,
+                                 {'image_size_x': 800, 'image_size_y': 600, 'fov': 110})
+
+# RGB 相机（跟随）
 camera_follow = spawn_safe_sensor('sensor.camera.rgb',
                                   carla.Transform(carla.Location(x=-5.0, y=0, z=3.0), carla.Rotation(pitch=-10)),
-                                  vehicle)
-lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
-if lidar_bp:
-    lidar_bp.set_attribute('range', '100')
-    lidar_bp.set_attribute('points_per_second', '50000')
-    lidar_bp.set_attribute('rotation_frequency', '10')
+                                  vehicle,
+                                  {'image_size_x': 1024, 'image_size_y': 768, 'fov': 90})
+
+# 激光雷达
 lidar = spawn_safe_sensor('sensor.lidar.ray_cast',
                           carla.Transform(carla.Location(x=0, z=2.5)),
-                          vehicle)
+                          vehicle,
+                          {'range': 100, 'points_per_second': 50000, 'rotation_frequency': 10})
+
+# 碰撞传感器
 collision_sensor = spawn_safe_sensor('sensor.other.collision',
                                      carla.Transform(),
                                      vehicle)
 
-# ====================== 回调函数 ======================
-def safe_callback(func):
-    def wrapper(data):
-        try:
-            func(data)
-        except Exception as e:
-            global error_count
-            error_count += 1
-            if error_count % 100 == 1:
-                print(f"回调错误: {e}")
-    return wrapper
+# 语义分割相机（与跟随相机位置相同）
+semantic_camera = spawn_safe_sensor('sensor.camera.semantic_segmentation',
+                                    carla.Transform(carla.Location(x=-5.0, y=0, z=3.0), carla.Rotation(pitch=-10)),
+                                    vehicle,
+                                    {'image_size_x': 1024, 'image_size_y': 768, 'fov': 90})
 
-@safe_callback
+# ====================== 回调函数（无装饰器，直接 try-except） ======================
 def on_camera_front(data):
     global latest_camera
-    img = np.frombuffer(data.raw_data, dtype=np.uint8)
-    img = img.reshape((data.height, data.width, 4))[:, :, :3]
-    latest_camera = img
+    try:
+        img = np.frombuffer(data.raw_data, dtype=np.uint8)
+        img = img.reshape((data.height, data.width, 4))[:, :, :3]
+        latest_camera = img
+    except Exception as e:
+        global error_count
+        error_count += 1
+        if error_count % 100 == 1:
+            print(f"前置相机回调错误: {e}")
 
-@safe_callback
 def on_camera_follow(data):
     global latest_follow
-    img = np.frombuffer(data.raw_data, dtype=np.uint8)
-    img = img.reshape((data.height, data.width, 4))[:, :, :3]
-    latest_follow = img
+    try:
+        img = np.frombuffer(data.raw_data, dtype=np.uint8)
+        img = img.reshape((data.height, data.width, 4))[:, :, :3]
+        latest_follow = img
+    except Exception as e:
+        global error_count
+        error_count += 1
+        if error_count % 100 == 1:
+            print(f"跟随相机回调错误: {e}")
 
-@safe_callback
+def on_semantic(data):
+    global latest_semantic
+    try:
+        # 关键：使用官方 CityScapes 调色板转换
+        data.convert(carla.ColorConverter.CityScapesPalette)
+        img = np.frombuffer(data.raw_data, dtype=np.uint8)
+        img = img.reshape((data.height, data.width, 4))[:, :, :3]
+        # CARLA 转换后是 BGR 格式，如果需要 RGB 可转换，但 OpenCV 显示 BGR 也没问题
+        latest_semantic = img
+    except Exception as e:
+        global error_count
+        error_count += 1
+        if error_count % 100 == 1:
+            print(f"语义相机回调错误: {e}")
+
 def on_lidar(data):
     global latest_lidar
-    latest_lidar = data
+    try:
+        latest_lidar = data
+    except Exception as e:
+        global error_count
+        error_count += 1
+        if error_count % 100 == 1:
+            print(f"雷达回调错误: {e}")
 
-@safe_callback
 def on_collision(event):
     global collision_cooldown, collision_cooldown_time
-    now = time.time()
-    if collision_cooldown and (now - collision_cooldown_time) < COLLISION_COOLDOWN_SEC:
-        return
-    collision_cooldown = True
-    collision_cooldown_time = now
     try:
+        now = time.time()
+        if collision_cooldown and (now - collision_cooldown_time) < COLLISION_COOLDOWN_SEC:
+            return
+        collision_cooldown = True
+        collision_cooldown_time = now
         impulse = event.normal_impulse
         magnitude = np.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
@@ -289,8 +324,10 @@ def on_collision(event):
     except Exception as e:
         print(f"碰撞保存失败: {e}")
 
+# 订阅传感器
 if camera_front: camera_front.listen(on_camera_front)
 if camera_follow: camera_follow.listen(on_camera_follow)
+if semantic_camera: semantic_camera.listen(on_semantic)
 if lidar: lidar.listen(on_lidar)
 if collision_sensor: collision_sensor.listen(on_collision)
 
@@ -312,23 +349,26 @@ def draw_speedometer(image, vehicle):
                     (x, y+bar_h+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
         cv2.putText(image, f"FPS:{fps:.1f} Err:{error_count}", 
                     (x, y+bar_h+40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+        mode_text = "SEMANTIC" if display_mode == "semantic" else "RGB"
+        cv2.putText(image, f"Mode: {mode_text} (press S)", (x, y+bar_h+60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
     except Exception as e:
         pass
 
 # ====================== 等待传感器就绪 ======================
 print("等待传感器数据...", end="")
 timeout_start = time.time()
-while (latest_follow is None or latest_camera is None or latest_lidar is None) and (time.time() - timeout_start < 12):
+while (latest_follow is None or latest_camera is None or latest_lidar is None or latest_semantic is None) and (time.time() - timeout_start < 12):
     time.sleep(0.2)
     print(".", end="", flush=True)
 print()
-if latest_follow is not None:
-    print("✅ 传感器就绪")
+if latest_follow is not None and latest_semantic is not None:
+    print("✅ 所有传感器就绪（RGB + 语义）")
 else:
     print("⚠️ 部分传感器未就绪，继续运行")
 
 # ====================== 主循环 ======================
 print(f"每 {SAVE_INTERVAL//60} 分钟自动保存，碰撞自动保存，动态交通已启用（最多{MAX_VEHICLES}车/{MAX_PEDESTRIANS}人）")
+print("🎨 按 S 键切换显示模式（RGB / 语义分割）")
 print("按 Q/ESC 退出")
 
 loop_counter = 0
@@ -336,7 +376,6 @@ try:
     while True:
         loop_counter += 1
         now = time.time()
-        # 每 500 帧打印一次心跳，证明程序还在运行
         if loop_counter % 500 == 0:
             print(f"♥ 心跳: 已运行 {loop_counter} 帧, 车辆={len(spawned_vehicles)}, 行人={len(spawned_pedestrians)}")
 
@@ -345,7 +384,6 @@ try:
             ego_loc = vehicle.get_location()
         except Exception as e:
             print(f"❌ 获取自车位置失败: {e}")
-            # 尝试重新获取 world 和 vehicle（可能是服务器重启）
             try:
                 world = client.get_world()
                 vehicle = world.get_actor(vehicle.id)
@@ -376,42 +414,63 @@ try:
             frame_count = 0
             last_fps_time = now
 
-        # 画面合成
-        display = None
-        if latest_follow is not None:
-            display = latest_follow.copy()
-            draw_speedometer(display, vehicle)
+        # 画面合成（根据模式选择主画面）
+        if display_mode == "semantic" and latest_semantic is not None:
+            main_display = latest_semantic.copy()
+            draw_speedometer(main_display, vehicle)
+            # 右下角小窗仍然显示 RGB 车载相机
             if latest_camera is not None:
-                h, w = display.shape[:2]
+                h, w = main_display.shape[:2]
                 sw = max(160, w//4)
                 sh = int(sw * latest_camera.shape[0] / latest_camera.shape[1])
                 small = cv2.resize(latest_camera, (sw, sh))
                 x = w - sw - 10
                 y = h - sh - 10
                 if x > 0 and y > 0:
-                    display[y:y+sh, x:x+sw] = small
-                    cv2.rectangle(display, (x-1,y-1), (x+sw+1,y+sh+1), (255,255,255), 2)
+                    main_display[y:y+sh, x:x+sw] = small
+                    cv2.rectangle(main_display, (x-1,y-1), (x+sw+1,y+sh+1), (255,255,255), 2)
+        elif latest_follow is not None:
+            main_display = latest_follow.copy()
+            draw_speedometer(main_display, vehicle)
+            if latest_camera is not None:
+                h, w = main_display.shape[:2]
+                sw = max(160, w//4)
+                sh = int(sw * latest_camera.shape[0] / latest_camera.shape[1])
+                small = cv2.resize(latest_camera, (sw, sh))
+                x = w - sw - 10
+                y = h - sh - 10
+                if x > 0 and y > 0:
+                    main_display[y:y+sh, x:x+sw] = small
+                    cv2.rectangle(main_display, (x-1,y-1), (x+sw+1,y+sh+1), (255,255,255), 2)
         elif latest_camera is not None:
-            display = latest_camera.copy()
-            draw_speedometer(display, vehicle)
+            main_display = latest_camera.copy()
+            draw_speedometer(main_display, vehicle)
         else:
-            display = np.zeros((600,800,3), dtype=np.uint8)
-            cv2.putText(display, "Waiting for sensors...", (50,300), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            main_display = np.zeros((600,800,3), dtype=np.uint8)
+            cv2.putText(main_display, "Waiting for sensors...", (50,300), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
 
-        if display is not None:
-            cv2.imshow("CARLA", display)
+        cv2.imshow("CARLA", main_display)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             print("用户主动退出")
             break
+        elif key == ord('s') or key == ord('S'):
+            if display_mode == "rgb":
+                display_mode = "semantic"
+                print("🔮 切换到语义分割视图")
+            else:
+                display_mode = "rgb"
+                print("🌈 切换到 RGB 视图")
 
-        # 定时保存
+        # 定时保存（RGB 图像、点云、语义图）
         if now - last_save_time >= SAVE_INTERVAL:
             if latest_camera is not None and latest_lidar is not None:
                 ts = str(int(now))
                 cv2.imwrite(os.path.join(image_folder, f"{ts}.png"), latest_camera)
                 latest_lidar.save_to_disk(os.path.join(lidar_folder, f"{ts}.ply"))
+                if latest_semantic is not None:
+                    cv2.imwrite(os.path.join(semantic_folder, f"semantic_{ts}.png"), latest_semantic)
                 print(f"💾 定时保存 {ts}")
                 last_save_time = now
 
@@ -424,7 +483,7 @@ except Exception as e:
     traceback.print_exc()
 finally:
     cv2.destroyAllWindows()
-    # 清理所有动态生成的 actor
+    # 清理动态生成的 actors
     for actor in all_spawned_actors:
         if actor:
             try:
@@ -433,7 +492,7 @@ finally:
             except:
                 pass
     # 清理传感器和自车
-    for actor in [camera_front, camera_follow, lidar, collision_sensor, vehicle]:
+    for actor in [camera_front, camera_follow, semantic_camera, lidar, collision_sensor, vehicle]:
         if actor:
             try:
                 if hasattr(actor, 'stop'): actor.stop()
