@@ -36,13 +36,19 @@ REMOVE_DISTANCE = 80
 SPAWN_INTERVAL = 5.0
 MAX_SPAWN_ATTEMPTS = 1
 
+# 障碍物警告配置
+OBSTACLE_WARNING_DISTANCE = 10.0
+OBSTACLE_DANGER_DISTANCE = 5.0
+OBSTACLE_FOV_ANGLE = 60.0
+OBSTACLE_MAX_HEIGHT = 2.0
+
 # 全局变量
 last_save_time = time.time()
-latest_camera = None          # RGB 车载相机
-latest_follow = None          # RGB 跟随相机
+latest_camera = None
+latest_follow = None
 latest_lidar = None
-latest_semantic = None        # 语义分割彩色图
-display_mode = "rgb"          # "rgb" 或 "semantic"
+latest_semantic = None
+display_mode = "rgb"
 
 collision_cooldown = False
 collision_cooldown_time = 0
@@ -51,7 +57,9 @@ frame_count = 0
 fps = 0
 last_fps_time = time.time()
 
-# 动态生成相关
+closest_obstacle_distance = float('inf')
+obstacle_warning_active = False
+
 spawned_vehicles = []
 spawned_pedestrians = []
 all_spawned_actors = []
@@ -59,7 +67,7 @@ last_spawn_time = time.time()
 vehicle_blueprints = []
 pedestrian_blueprints = []
 
-# ====================== 连接 CARLA ======================
+# ====================== 连接 CARLA（带重试） ======================
 def connect_carla(retries=3):
     for i in range(retries):
         try:
@@ -208,20 +216,28 @@ def remove_far_actors(ego_location):
         except:
             pass
 
-# ====================== 传感器创建 ======================
-def spawn_safe_sensor(bp_name, transform, attach_to, attributes=None):
-    try:
-        bp = blueprint_library.find(bp_name)
-        if bp is None:
-            print(f"找不到蓝图 {bp_name}")
-            return None
-        if attributes:
-            for key, value in attributes.items():
-                bp.set_attribute(key, str(value))
-        return world.spawn_actor(bp, transform, attach_to=attach_to)
-    except Exception as e:
-        print(f"传感器 {bp_name} 生成失败: {e}")
-        return None
+# ====================== 传感器创建（增加重试） ======================
+def spawn_safe_sensor(bp_name, transform, attach_to, attributes=None, retries=2):
+    for attempt in range(retries):
+        try:
+            bp = blueprint_library.find(bp_name)
+            if bp is None:
+                print(f"找不到蓝图 {bp_name}")
+                return None
+            if attributes:
+                for key, value in attributes.items():
+                    bp.set_attribute(key, str(value))
+            actor = world.spawn_actor(bp, transform, attach_to=attach_to)
+            if actor:
+                return actor
+            else:
+                print(f"生成 {bp_name} 失败，重试 {attempt+1}/{retries}")
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"传感器 {bp_name} 生成异常 (尝试 {attempt+1}/{retries}): {e}")
+            time.sleep(0.5)
+    print(f"❌ 传感器 {bp_name} 最终生成失败")
+    return None
 
 # RGB 相机（前向）
 camera_front = spawn_safe_sensor('sensor.camera.rgb',
@@ -246,13 +262,18 @@ collision_sensor = spawn_safe_sensor('sensor.other.collision',
                                      carla.Transform(),
                                      vehicle)
 
-# 语义分割相机（与跟随相机位置相同）
+# 语义分割相机
 semantic_camera = spawn_safe_sensor('sensor.camera.semantic_segmentation',
                                     carla.Transform(carla.Location(x=-5.0, y=0, z=3.0), carla.Rotation(pitch=-10)),
                                     vehicle,
                                     {'image_size_x': 1024, 'image_size_y': 768, 'fov': 90})
 
-# ====================== 回调函数（无装饰器，直接 try-except） ======================
+# 如果核心传感器缺失，退出
+if camera_front is None or camera_follow is None or lidar is None or semantic_camera is None:
+    print("❌ 核心传感器生成失败，请检查 CARLA 服务器状态")
+    sys.exit(1)
+
+# ====================== 回调函数 ======================
 def on_camera_front(data):
     global latest_camera
     try:
@@ -280,11 +301,9 @@ def on_camera_follow(data):
 def on_semantic(data):
     global latest_semantic
     try:
-        # 关键：使用官方 CityScapes 调色板转换
         data.convert(carla.ColorConverter.CityScapesPalette)
         img = np.frombuffer(data.raw_data, dtype=np.uint8)
         img = img.reshape((data.height, data.width, 4))[:, :, :3]
-        # CARLA 转换后是 BGR 格式，如果需要 RGB 可转换，但 OpenCV 显示 BGR 也没问题
         latest_semantic = img
     except Exception as e:
         global error_count
@@ -325,14 +344,47 @@ def on_collision(event):
         print(f"碰撞保存失败: {e}")
 
 # 订阅传感器
-if camera_front: camera_front.listen(on_camera_front)
-if camera_follow: camera_follow.listen(on_camera_follow)
-if semantic_camera: semantic_camera.listen(on_semantic)
-if lidar: lidar.listen(on_lidar)
-if collision_sensor: collision_sensor.listen(on_collision)
+camera_front.listen(on_camera_front)
+camera_follow.listen(on_camera_follow)
+semantic_camera.listen(on_semantic)
+lidar.listen(on_lidar)
+if collision_sensor:
+    collision_sensor.listen(on_collision)
 
-# ====================== 车速表绘制 ======================
+# ====================== 障碍物距离计算 ======================
+def compute_closest_obstacle(lidar_data, ego_location, ego_rotation):
+    if lidar_data is None:
+        return float('inf')
+    points = np.frombuffer(lidar_data.raw_data, dtype=np.float32)
+    points = points.reshape((-1, 4))[:, :3]
+    if len(points) == 0:
+        return float('inf')
+    yaw_rad = math.radians(ego_rotation.yaw)
+    cos_yaw = math.cos(yaw_rad)
+    sin_yaw = math.sin(yaw_rad)
+    half_angle = math.radians(OBSTACLE_FOV_ANGLE / 2.0)
+    min_dist = float('inf')
+    for pt in points:
+        dx = pt[0] - ego_location.x
+        dy = pt[1] - ego_location.y
+        dz = pt[2] - ego_location.z
+        if abs(dz) > OBSTACLE_MAX_HEIGHT:
+            continue
+        local_x = dx * cos_yaw + dy * sin_yaw
+        local_y = -dx * sin_yaw + dy * cos_yaw
+        if local_x <= 0:
+            continue
+        angle = math.atan2(abs(local_y), local_x)
+        if angle > half_angle:
+            continue
+        dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if dist < min_dist:
+            min_dist = dist
+    return min_dist
+
+# ====================== 绘制函数 ======================
 def draw_speedometer(image, vehicle):
+    global closest_obstacle_distance, obstacle_warning_active
     try:
         vel = vehicle.get_velocity()
         speed = 3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
@@ -351,6 +403,19 @@ def draw_speedometer(image, vehicle):
                     (x, y+bar_h+40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
         mode_text = "SEMANTIC" if display_mode == "semantic" else "RGB"
         cv2.putText(image, f"Mode: {mode_text} (press S)", (x, y+bar_h+60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+        
+        if obstacle_warning_active:
+            warn_x = image.shape[1] - 250
+            warn_y = 30
+            if closest_obstacle_distance < OBSTACLE_DANGER_DISTANCE:
+                color = (0, 0, 255)
+                status = "DANGER!"
+            else:
+                color = (0, 255, 255)
+                status = "WARNING!"
+            cv2.rectangle(image, (warn_x-10, warn_y-10), (warn_x+180, warn_y+50), color, -1)
+            cv2.putText(image, f"{status} {closest_obstacle_distance:.1f}m", 
+                        (warn_x, warn_y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
     except Exception as e:
         pass
 
@@ -369,6 +434,7 @@ else:
 # ====================== 主循环 ======================
 print(f"每 {SAVE_INTERVAL//60} 分钟自动保存，碰撞自动保存，动态交通已启用（最多{MAX_VEHICLES}车/{MAX_PEDESTRIANS}人）")
 print("🎨 按 S 键切换显示模式（RGB / 语义分割）")
+print("⚠️ 激光雷达障碍物警告已开启（前方10米内预警，5米内危险）")
 print("按 Q/ESC 退出")
 
 loop_counter = 0
@@ -379,9 +445,9 @@ try:
         if loop_counter % 500 == 0:
             print(f"♥ 心跳: 已运行 {loop_counter} 帧, 车辆={len(spawned_vehicles)}, 行人={len(spawned_pedestrians)}")
 
-        # 获取自车位置
         try:
             ego_loc = vehicle.get_location()
+            ego_rot = vehicle.get_transform().rotation
         except Exception as e:
             print(f"❌ 获取自车位置失败: {e}")
             try:
@@ -390,6 +456,14 @@ try:
                 continue
             except:
                 break
+
+        # 障碍物检测
+        if latest_lidar is not None:
+            closest_obstacle_distance = compute_closest_obstacle(latest_lidar, ego_loc, ego_rot)
+            obstacle_warning_active = (closest_obstacle_distance < OBSTACLE_WARNING_DISTANCE)
+        else:
+            closest_obstacle_distance = float('inf')
+            obstacle_warning_active = False
 
         # 动态生成
         if now - last_spawn_time >= SPAWN_INTERVAL:
@@ -400,25 +474,21 @@ try:
                     spawn_random_pedestrian_near(ego_loc)
             last_spawn_time = now
 
-        # 移除远处 actor
         remove_far_actors(ego_loc)
 
-        # 重置碰撞冷却
         if collision_cooldown and (now - collision_cooldown_time) >= COLLISION_COOLDOWN_SEC:
             collision_cooldown = False
 
-        # FPS 计算
         frame_count += 1
         if now - last_fps_time >= 1.0:
             fps = frame_count / (now - last_fps_time)
             frame_count = 0
             last_fps_time = now
 
-        # 画面合成（根据模式选择主画面）
+        # 画面合成
         if display_mode == "semantic" and latest_semantic is not None:
             main_display = latest_semantic.copy()
             draw_speedometer(main_display, vehicle)
-            # 右下角小窗仍然显示 RGB 车载相机
             if latest_camera is not None:
                 h, w = main_display.shape[:2]
                 sw = max(160, w//4)
@@ -456,14 +526,9 @@ try:
             print("用户主动退出")
             break
         elif key == ord('s') or key == ord('S'):
-            if display_mode == "rgb":
-                display_mode = "semantic"
-                print("🔮 切换到语义分割视图")
-            else:
-                display_mode = "rgb"
-                print("🌈 切换到 RGB 视图")
+            display_mode = "semantic" if display_mode == "rgb" else "rgb"
+            print(f"🔮 切换到 {display_mode.upper()} 视图")
 
-        # 定时保存（RGB 图像、点云、语义图）
         if now - last_save_time >= SAVE_INTERVAL:
             if latest_camera is not None and latest_lidar is not None:
                 ts = str(int(now))
@@ -483,7 +548,6 @@ except Exception as e:
     traceback.print_exc()
 finally:
     cv2.destroyAllWindows()
-    # 清理动态生成的 actors
     for actor in all_spawned_actors:
         if actor:
             try:
@@ -491,7 +555,6 @@ finally:
                 actor.destroy()
             except:
                 pass
-    # 清理传感器和自车
     for actor in [camera_front, camera_follow, semantic_camera, lidar, collision_sensor, vehicle]:
         if actor:
             try:
