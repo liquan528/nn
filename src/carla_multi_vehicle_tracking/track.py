@@ -11,7 +11,6 @@ YOLO + DeepSort 多车跟踪系统
 【新增：车辆轨迹绘制模块】
 【新增：第六模块 车流量统计】
 【新增：第七模块 车辆属性识别】
-【新增：第八模块 异常停车检测】
 
 功能说明：
 1. 实时跟踪多个车辆目标
@@ -24,7 +23,6 @@ YOLO + DeepSort 多车跟踪系统
 8. 绘制车辆运动轨迹
 9. 统计车流量（驶入/驶出）
 10. 识别车辆属性（车型、颜色）
-11. 检测异常停车/车辆滞留
 """
 
 from __future__ import print_function, absolute_import
@@ -123,18 +121,6 @@ CAR_ATTR_FONT_SCALE = 0.4
 CAR_ATTR_FONT_THICKNESS = 1
 CAR_ATTR_TEXT_COLOR = (255, 255, 255)  # 白色文字
 
-# ==================== 【新增：第八模块 异常停车检测】配置参数 ====================
-# 静止超过3秒判定滞留
-PARKED_TIME_THRESHOLD = 3
-# 位移阈值（像素），小于此值认为静止
-STOP_DISTANCE_THRESHOLD = 5
-# 异常停车检测UI配置
-PARKED_WARNING_COLOR = (0, 0, 255)  # 红色
-PARKED_WARNING_TEXT = "异常停车"
-PARKED_FONT = cv2.FONT_HERSHEY_SIMPLEX
-PARKED_FONT_SCALE = 0.5
-PARKED_FONT_THICKNESS = 2
-
 # ==================== 【原有】基础配置常量 ====================
 # 【新增：车辆轨迹绘制模块】轨迹绘制配置
 MAX_TRAJECTORY_POINTS = 15  # 轨迹保留15帧
@@ -193,7 +179,7 @@ UI_TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX  # 使用的字体
 
 # ==================== 【新增：UI界面增强模块】函数定义 ====================
 
-def draw_ui_info_bar(frame, vehicle_count, collision_warnings, overspeed_count, retrograde_count, is_congested, car_type_stats=None, car_color_stats=None, parked_count=0):
+def draw_ui_info_bar(frame, vehicle_count, collision_warnings, overspeed_count, retrograde_count, is_congested, car_type_stats=None, car_color_stats=None):
     """
     【新增：UI界面增强模块】
     在画面顶部绘制黑色半透明信息条，显示实时数据
@@ -207,7 +193,6 @@ def draw_ui_info_bar(frame, vehicle_count, collision_warnings, overspeed_count, 
         is_congested: 是否拥堵
         car_type_stats: 【新增：第七模块 车辆属性识别】车型统计字典
         car_color_stats: 【新增：第七模块 车辆属性识别】颜色统计字典
-        parked_count: 【新增：第八模块 异常停车检测】异常停车数量
     
     返回:
         frame: 绘制了信息条的帧
@@ -232,8 +217,7 @@ def draw_ui_info_bar(frame, vehicle_count, collision_warnings, overspeed_count, 
         f"碰撞预警: {collision_warnings}",
         f"超速车辆: {overspeed_count}",
         f"逆行车辆: {retrograde_count}",
-        f"拥堵状态: {congestion_status}",
-        f"异常停车: {parked_count}"
+        f"拥堵状态: {congestion_status}"
     ]
     
     # 【新增：第七模块 车辆属性识别】添加车型统计信息
@@ -514,158 +498,6 @@ def draw_car_attr_label(frame, bbox, track_id, car_attr_dict):
     cv2.putText(frame, label_text, (label_x, label_y),
                 CAR_ATTR_FONT, CAR_ATTR_FONT_SCALE,
                 CAR_ATTR_TEXT_COLOR, CAR_ATTR_FONT_THICKNESS, cv2.LINE_AA)
-    
-    return frame
-
-# ==================== 【新增：第八模块 异常停车检测】函数定义 ====================
-
-def initialize_parked_detection():
-    """
-    【新增：第八模块 异常停车检测】
-    初始化异常停车检测相关变量
-    
-    返回:
-        dict: vehicle_stop_timer - 记录车辆静止时间
-        dict: vehicle_last_pos - 记录车辆上一帧位置
-        set: warned_ids - 已报警的车辆ID集合
-    """
-    vehicle_stop_timer = {}
-    vehicle_last_pos = {}
-    warned_ids = set()
-    return vehicle_stop_timer, vehicle_last_pos, warned_ids
-
-def update_parked_detection(tracked_vehicles, vehicle_stop_timer, vehicle_last_pos, warned_ids, fps):
-    """
-    【新增：第八模块 异常停车检测】
-    更新异常停车检测逻辑
-    
-    参数:
-        tracked_vehicles: DeepSort输出的跟踪结果
-        vehicle_stop_timer: 车辆静止时间字典
-        vehicle_last_pos: 车辆上一帧位置字典
-        warned_ids: 已报警的车辆ID集合
-        fps: 视频帧率
-    
-    返回:
-        dict: 更新后的vehicle_stop_timer
-        dict: 更新后的vehicle_last_pos
-        set: 更新后的warned_ids
-        set: 当前异常停车的车辆ID集合
-    """
-    parked_ids = set()
-    current_ids = set()
-    
-    for output in tracked_vehicles:
-        if len(output) >= 5:
-            try:
-                x1, y1, x2, y2 = map(int, output[0:4])
-                track_id = int(output[4])
-                current_ids.add(track_id)
-                
-                # 计算当前中心点
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                current_pos = (center_x, center_y)
-                
-                # 检查是否有上一帧位置
-                if track_id in vehicle_last_pos:
-                    last_pos = vehicle_last_pos[track_id]
-                    # 计算位移距离
-                    distance = ((current_pos[0] - last_pos[0]) ** 2 + (current_pos[1] - last_pos[1]) ** 2) ** 0.5
-                    
-                    # 如果位移小于阈值，增加计时器
-                    if distance < STOP_DISTANCE_THRESHOLD:
-                        if track_id not in vehicle_stop_timer:
-                            vehicle_stop_timer[track_id] = 0.0
-                        vehicle_stop_timer[track_id] += 1.0 / fps
-                    else:
-                        # 车辆移动，重置计时器
-                        if track_id in vehicle_stop_timer:
-                            vehicle_stop_timer[track_id] = 0.0
-                        # 车辆移动，从已报警集合中移除，允许再次报警
-                        if track_id in warned_ids:
-                            warned_ids.remove(track_id)
-                else:
-                    # 新出现的车辆，初始化计时器
-                    vehicle_stop_timer[track_id] = 0.0
-                
-                # 更新上一帧位置
-                vehicle_last_pos[track_id] = current_pos
-                
-                # 检查是否超过阈值
-                if track_id in vehicle_stop_timer and vehicle_stop_timer[track_id] >= PARKED_TIME_THRESHOLD:
-                    parked_ids.add(track_id)
-                    # 同一ID只报警一次
-                    if track_id not in warned_ids:
-                        print(f"【异常停车警告】车辆ID:{track_id} 长时间静止，疑似违停/事故")
-                        warned_ids.add(track_id)
-                        
-            except (ValueError, TypeError, IndexError):
-                continue
-    
-    # 清理消失车辆的数据
-    for track_id in list(vehicle_stop_timer.keys()):
-        if track_id not in current_ids:
-            del vehicle_stop_timer[track_id]
-    for track_id in list(vehicle_last_pos.keys()):
-        if track_id not in current_ids:
-            del vehicle_last_pos[track_id]
-    for track_id in list(warned_ids):
-        if track_id not in current_ids:
-            warned_ids.remove(track_id)
-    
-    return vehicle_stop_timer, vehicle_last_pos, warned_ids, parked_ids
-
-def draw_parked_warnings(frame, parked_ids, tracked_vehicles):
-    """
-    【新增：第八模块 异常停车检测】
-    在画面上绘制异常停车警告信息
-    
-    参数:
-        frame: 视频帧
-        parked_ids: 异常停车的车辆ID集合
-        tracked_vehicles: 跟踪结果
-    
-    返回:
-        frame: 绘制了警告信息的帧
-    """
-    for output in tracked_vehicles:
-        if len(output) >= 5:
-            try:
-                x1, y1, x2, y2 = map(int, output[0:4])
-                track_id = int(output[4])
-                
-                if track_id in parked_ids:
-                    # 绘制红色高亮边框
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), PARKED_WARNING_COLOR, 4)
-                    # 在框上方绘制警告文字
-                    (text_width, text_height), _ = cv2.getTextSize(
-                        PARKED_WARNING_TEXT, 
-                        PARKED_FONT, 
-                        PARKED_FONT_SCALE, 
-                        PARKED_FONT_THICKNESS
-                    )
-                    # 绘制文字背景
-                    cv2.rectangle(
-                        frame, 
-                        (x1, y1 - text_height - 10), 
-                        (x1 + text_width + 10, y1), 
-                        PARKED_WARNING_COLOR, 
-                        -1
-                    )
-                    # 绘制文字
-                    cv2.putText(
-                        frame, 
-                        PARKED_WARNING_TEXT, 
-                        (x1 + 5, y1 - 5), 
-                        PARKED_FONT, 
-                        PARKED_FONT_SCALE, 
-                        (255, 255, 255), 
-                        PARKED_FONT_THICKNESS, 
-                        cv2.LINE_AA
-                    )
-            except (ValueError, TypeError, IndexError):
-                continue
     
     return frame
 
@@ -1240,10 +1072,6 @@ class VehicleTracker:
         # 【新增：第七模块 车辆属性识别】初始化车辆属性字典
         self.car_attr = initialize_car_attr()
         
-        # 【新增：第八模块 异常停车检测】初始化异常停车检测变量
-        self.vehicle_stop_timer, self.vehicle_last_pos, self.warned_ids = initialize_parked_detection()
-        self.parked_ids = set()
-        
         if ULTRALYTICS_AVAILABLE:
             self._load_yolo_model()
         
@@ -1447,15 +1275,6 @@ class VehicleTracker:
                     # 【新增：第七模块 车辆属性识别】更新车辆属性
                     self.car_attr = update_car_attr(outputs, frame, self.car_attr)
                     
-                    # 【新增：第八模块 异常停车检测】更新异常停车检测
-                    self.vehicle_stop_timer, self.vehicle_last_pos, self.warned_ids, self.parked_ids = update_parked_detection(
-                        outputs, 
-                        self.vehicle_stop_timer, 
-                        self.vehicle_last_pos, 
-                        self.warned_ids,
-                        FPS
-                    )
-                    
                     speed_dict, overspeed_ids = estimate_vehicle_speeds(
                         self.vehicle_traj,
                         FPS,
@@ -1486,9 +1305,6 @@ class VehicleTracker:
                     frame = draw_collision_warning(frame, collision_risk_ids, outputs)
                     frame = draw_violation_warnings(frame, retrograde_ids, is_congested, outputs)
                     
-                    # 【新增：第八模块 异常停车检测】绘制异常停车警告
-                    frame = draw_parked_warnings(frame, self.parked_ids, outputs)
-                    
                     min_len = min(len(outputs), len(conf_score), len(cls_id))
                     for i in range(min_len):
                         frame = self.draw_bbox(
@@ -1509,7 +1325,6 @@ class VehicleTracker:
                     vehicle_count = len(outputs)
                     overspeed_count = len(overspeed_ids)
                     retrograde_count = len(retrograde_ids)
-                    parked_count = len(self.parked_ids)
                     frame = draw_ui_info_bar(
                         frame, 
                         vehicle_count, 
@@ -1518,8 +1333,7 @@ class VehicleTracker:
                         retrograde_count, 
                         is_congested,
                         car_type_stats,
-                        car_color_stats,
-                        parked_count
+                        car_color_stats
                     )
                     
                     frame = draw_traffic_counting_ui(
@@ -1746,8 +1560,7 @@ def parse_args():
                    '【新增功能】UI界面增强\n'
                    '【新增功能】车辆轨迹绘制\n'
                    '【新增功能】第六模块 车流量统计\n'
-                   '【新增功能】第七模块 车辆属性识别\n'
-                   '【新增功能】第八模块 异常停车检测',
+                   '【新增功能】第七模块 车辆属性识别',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -1771,7 +1584,6 @@ def check_environment():
     print("【新增：车辆轨迹绘制模块】")
     print("【新增：第六模块 车流量统计】")
     print("【新增：第七模块 车辆属性识别】")
-    print("【新增：第八模块 异常停车检测】")
     print("=" * 60)
     print(f"Python: {sys.version}")
     print(f"平台: {sys.platform}")
@@ -1801,10 +1613,6 @@ def check_environment():
     print("\n【新增：第七模块 车辆属性识别】当前配置:")
     print(f"  - 车型列表: {', '.join(car_type)}")
     print(f"  - 颜色列表: {', '.join(car_color)}")
-    
-    print("\n【新增：第八模块 异常停车检测】当前配置:")
-    print(f"  - 静止阈值: {PARKED_TIME_THRESHOLD} 秒")
-    print(f"  - 位移阈值: {STOP_DISTANCE_THRESHOLD} 像素")
     print("=" * 60)
 
 def main():
